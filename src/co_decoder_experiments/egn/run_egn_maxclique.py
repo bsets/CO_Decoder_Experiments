@@ -2,18 +2,18 @@ from __future__ import annotations
 
 import argparse
 import csv
-import gzip
 import json
 import math
-import os
 import random
 import tarfile
 import time
 import zipfile
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 from urllib.request import urlretrieve
+import urllib.request
 
 import networkx as nx
 import numpy as np
@@ -28,19 +28,27 @@ from tqdm import tqdm
 # Reproducibility
 # ---------------------------------------------------------------------
 
+
 def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    # Determinism can slow training but is useful for research reproducibility.
+
+    # Determinism helps reproducibility. It may slow training.
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
+
+def sync_if_cuda(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize()
 
 
 # ---------------------------------------------------------------------
 # Download helpers
 # ---------------------------------------------------------------------
+
 
 def download_file(url: str, dest: Path, retries: int = 3) -> Path:
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -70,13 +78,18 @@ def download_file(url: str, dest: Path, retries: int = 3) -> Path:
 # TU Dortmund dataset loader for IMDB-BINARY and COLLAB
 # ---------------------------------------------------------------------
 
+
 TU_URLS = {
     "imdb_binary": "https://www.chrsmrrs.com/graphkerneldatasets/IMDB-BINARY.zip",
     "collab": "https://www.chrsmrrs.com/graphkerneldatasets/COLLAB.zip",
 }
 
 
-def load_tu_graphs(dataset_name: str, data_root: Path, limit: Optional[int] = None) -> List[nx.Graph]:
+def load_tu_graphs(
+    dataset_name: str,
+    data_root: Path,
+    limit: Optional[int] = None,
+) -> List[nx.Graph]:
     key = dataset_name.lower()
     if key not in TU_URLS:
         raise ValueError(f"Unsupported TU dataset: {dataset_name}")
@@ -92,7 +105,6 @@ def load_tu_graphs(dataset_name: str, data_root: Path, limit: Optional[int] = No
         with zipfile.ZipFile(zip_path, "r") as zf:
             zf.extractall(extract_dir)
 
-    # TU zip extracts to a nested directory with uppercase dataset name.
     nested_dirs = [p for p in extract_dir.iterdir() if p.is_dir()]
     base = nested_dirs[0] if nested_dirs else extract_dir
 
@@ -118,9 +130,8 @@ def load_tu_graphs(dataset_name: str, data_root: Path, limit: Optional[int] = No
     graph_id_set = set(graph_ids)
 
     graphs_by_id: Dict[int, nx.Graph] = {gid: nx.Graph() for gid in graph_ids}
-
-    # Add nodes.
     local_id_maps: Dict[int, Dict[int, int]] = {gid: {} for gid in graph_ids}
+
     for global_node, gid in node_to_graph.items():
         if gid not in graph_id_set:
             continue
@@ -128,23 +139,25 @@ def load_tu_graphs(dataset_name: str, data_root: Path, limit: Optional[int] = No
         local_id_maps[gid][global_node] = local_idx
         graphs_by_id[gid].add_node(local_idx)
 
-    # Add edges.
     with edges_file.open("r", encoding="utf-8") as f:
         for line in f:
             parts = line.replace(" ", "").strip().split(",")
             if len(parts) != 2:
                 continue
+
             u_global, v_global = int(parts[0]), int(parts[1])
             gid_u = node_to_graph.get(u_global)
             gid_v = node_to_graph.get(v_global)
+
             if gid_u != gid_v or gid_u not in graph_id_set:
                 continue
+
             u = local_id_maps[gid_u][u_global]
             v = local_id_maps[gid_u][v_global]
             if u != v:
                 graphs_by_id[gid_u].add_edge(u, v)
 
-    graphs = []
+    graphs: List[nx.Graph] = []
     for gid in graph_ids:
         G = nx.convert_node_labels_to_integers(graphs_by_id[gid])
         G.graph["dataset"] = key
@@ -157,6 +170,7 @@ def load_tu_graphs(dataset_name: str, data_root: Path, limit: Optional[int] = No
 # ---------------------------------------------------------------------
 # SNAP Twitter ego-network loader
 # ---------------------------------------------------------------------
+
 
 def load_twitter_ego_graphs(data_root: Path, limit: Optional[int] = None) -> List[nx.Graph]:
     url = "https://snap.stanford.edu/data/twitter.tar.gz"
@@ -175,7 +189,7 @@ def load_twitter_ego_graphs(data_root: Path, limit: Optional[int] = None) -> Lis
     if limit is not None:
         edge_files = edge_files[:limit]
 
-    graphs = []
+    graphs: List[nx.Graph] = []
     for edge_file in edge_files:
         ego_id = edge_file.stem
         G = nx.Graph()
@@ -188,8 +202,8 @@ def load_twitter_ego_graphs(data_root: Path, limit: Optional[int] = None) -> Lis
                 u, v = parts
                 G.add_edge(u, v)
 
-        # SNAP readme says the ego node does not appear in the edge file,
-        # but is assumed to be linked to every node appearing in the file.
+        # The SNAP ego node is not listed in the edge file; add it and connect
+        # it to every node appearing in the ego network.
         ego_node = f"ego_{ego_id}"
         for node in list(G.nodes()):
             G.add_edge(ego_node, node)
@@ -205,6 +219,7 @@ def load_twitter_ego_graphs(data_root: Path, limit: Optional[int] = None) -> Lis
 # ---------------------------------------------------------------------
 # RB-style compatibility graph generator
 # ---------------------------------------------------------------------
+
 
 def generate_forced_rb_clique_graph(
     n_variables: int,
@@ -255,7 +270,7 @@ def generate_forced_rb_clique_graph(
 
 def generate_rb_dataset(name: str, count: int, seed: int) -> List[nx.Graph]:
     rng = random.Random(seed)
-    graphs = []
+    graphs: List[nx.Graph] = []
 
     if name == "rb_small":
         specs = [(20, 10), (25, 12), (30, 15)]
@@ -281,10 +296,16 @@ def generate_rb_dataset(name: str, count: int, seed: int) -> List[nx.Graph]:
 
 
 # ---------------------------------------------------------------------
-# Splits
+# Split assignment
 # ---------------------------------------------------------------------
 
-def assign_splits(graphs: List[nx.Graph], seed: int, train_frac=0.60, val_frac=0.20) -> Dict[str, List[nx.Graph]]:
+
+def assign_splits(
+    graphs: List[nx.Graph],
+    seed: int,
+    train_frac: float = 0.60,
+    val_frac: float = 0.20,
+) -> Dict[str, List[nx.Graph]]:
     rng = random.Random(seed)
     idx = list(range(len(graphs)))
     rng.shuffle(idx)
@@ -308,6 +329,7 @@ def assign_splits(graphs: List[nx.Graph], seed: int, train_frac=0.60, val_frac=0
 # Dense GCN model
 # ---------------------------------------------------------------------
 
+
 class DenseGCNLayer(nn.Module):
     def __init__(self, in_dim: int, out_dim: int):
         super().__init__()
@@ -320,10 +342,12 @@ class DenseGCNLayer(nn.Module):
 class EGNStyleGCN(nn.Module):
     def __init__(self, in_dim: int = 3, hidden_dim: int = 64, layers: int = 3):
         super().__init__()
+
         gcn_layers = []
         dims = [in_dim] + [hidden_dim] * layers
         for i in range(layers):
             gcn_layers.append(DenseGCNLayer(dims[i], dims[i + 1]))
+
         self.gcn_layers = nn.ModuleList(gcn_layers)
         self.out = nn.Linear(hidden_dim, 1)
 
@@ -335,8 +359,12 @@ class EGNStyleGCN(nn.Module):
         return torch.sigmoid(logits)
 
 
-def graph_to_tensors(G: nx.Graph, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def graph_to_tensors(
+    G: nx.Graph,
+    device: torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     n = G.number_of_nodes()
+
     adj_np = nx.to_numpy_array(G, nodelist=range(n), dtype=np.float32)
     adj = torch.tensor(adj_np, dtype=torch.float32, device=device)
 
@@ -362,8 +390,9 @@ def graph_to_tensors(G: nx.Graph, device: torch.device) -> Tuple[torch.Tensor, t
 
 
 # ---------------------------------------------------------------------
-# EGN-style loss and author decoder
+# EGN-style maximum-clique loss and author-style decoder
 # ---------------------------------------------------------------------
+
 
 def maxclique_egn_loss(probs: torch.Tensor, adj: torch.Tensor, beta: float) -> torch.Tensor:
     n = probs.shape[0]
@@ -376,7 +405,6 @@ def maxclique_egn_loss(probs: torch.Tensor, adj: torch.Tensor, beta: float) -> t
     expected_edges = (edge_mask * pp).sum()
     expected_nonedges = (nonedge_mask * pp).sum()
 
-    # Constant gamma is omitted because it does not change gradients.
     return -expected_edges + beta * expected_nonedges
 
 
@@ -394,7 +422,7 @@ def repair_to_clique(selected: List[int], probs: np.ndarray, adj: np.ndarray) ->
         return [int(np.argmax(probs))]
 
     ordered = sorted(selected, key=lambda i: probs[i], reverse=True)
-    clique = []
+    clique: List[int] = []
     for v in ordered:
         if all(adj[v, u] > 0.5 for u in clique):
             clique.append(v)
@@ -407,13 +435,11 @@ def repair_to_clique(selected: List[int], probs: np.ndarray, adj: np.ndarray) ->
 
 def egn_author_decoder(probs: np.ndarray, adj: np.ndarray, beta: float) -> List[int]:
     """
-    Author-style EGN decoder based on the README description:
-    sort nodes by probability, then derandomize by evaluating the loss
-    when p_i is fixed to 1 versus 0.
+    EGN-style conditional-expectation decoder.
 
-    A final clique repair is included because the EGN README notes that
-    feasibility should be manually checked if training does not make the
-    constraint loss small enough.
+    It sorts nodes by predicted probability and derandomizes by checking
+    whether fixing p_i to 1 or 0 gives lower unsupervised loss. A final greedy
+    repair guarantees the returned set is a valid clique.
     """
     p_work = probs.copy()
     order = np.argsort(-probs)
@@ -444,15 +470,18 @@ def is_valid_clique(nodes: List[int], adj: np.ndarray) -> bool:
 def exact_clique_size_if_small(G: nx.Graph, max_nodes: int) -> Tuple[Optional[int], str]:
     if G.number_of_nodes() > max_nodes:
         return None, "not_computed_large_graph"
+
     max_size = 0
     for clique in nx.find_cliques(G):
         max_size = max(max_size, len(clique))
+
     return max_size, "exact_networkx_find_cliques"
 
 
 # ---------------------------------------------------------------------
-# Training and evaluation
+# Results and cost schemas
 # ---------------------------------------------------------------------
+
 
 @dataclass
 class GraphResult:
@@ -474,6 +503,198 @@ class GraphResult:
     total_time_seconds: float
     seed: int
     epoch_selected: int
+
+
+@dataclass
+class CostRecord:
+    run_id: str
+    dataset: str
+    split: str
+    algorithm: str
+    decoder: str
+    operation: str
+    instance_type: str
+    region: str
+    device: str
+    seconds: float
+    ec2_hourly_usd: float
+    ec2_cost_per_second_usd: float
+    estimated_compute_cost_usd: float
+    seed: int
+    notes: str
+
+
+# ---------------------------------------------------------------------
+# EC2 context and operation-level cost tracking
+# ---------------------------------------------------------------------
+
+
+def _imds_v2_token(timeout_seconds: float = 0.2) -> Optional[str]:
+    try:
+        req = urllib.request.Request(
+            "http://169.254.169.254/latest/api/token",
+            method="PUT",
+            headers={"X-aws-ec2-metadata-token-ttl-seconds": "21600"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout_seconds) as response:
+            return response.read().decode("utf-8")
+    except Exception:
+        return None
+
+
+def _read_ec2_metadata(
+    path: str,
+    token: Optional[str],
+    timeout_seconds: float = 0.2,
+) -> Optional[str]:
+    try:
+        headers = {}
+        if token:
+            headers["X-aws-ec2-metadata-token"] = token
+
+        req = urllib.request.Request(
+            f"http://169.254.169.254/latest/{path}",
+            headers=headers,
+        )
+
+        with urllib.request.urlopen(req, timeout=timeout_seconds) as response:
+            return response.read().decode("utf-8")
+    except Exception:
+        return None
+
+
+def detect_ec2_context(cost_cfg: dict) -> dict:
+    manual_instance_type = cost_cfg.get("instance_type")
+    manual_region = cost_cfg.get("region")
+
+    token = _imds_v2_token()
+
+    instance_type = manual_instance_type
+    if not instance_type:
+        instance_type = _read_ec2_metadata("meta-data/instance-type", token)
+
+    region = manual_region
+    if not region:
+        identity_doc = _read_ec2_metadata("dynamic/instance-identity/document", token)
+        if identity_doc:
+            try:
+                region = json.loads(identity_doc).get("region")
+            except json.JSONDecodeError:
+                region = None
+
+    return {
+        "instance_type": instance_type or "unknown",
+        "region": region or "unknown",
+    }
+
+
+def make_cost_record(
+    run_id: str,
+    dataset: str,
+    split: str,
+    algorithm: str,
+    decoder: str,
+    operation: str,
+    instance_type: str,
+    region: str,
+    device: str,
+    seconds: float,
+    ec2_hourly_usd: float,
+    seed: int,
+    notes: str = "",
+) -> CostRecord:
+    cost_per_second = ec2_hourly_usd / 3600.0
+    estimated_cost = seconds * cost_per_second
+
+    return CostRecord(
+        run_id=run_id,
+        dataset=dataset,
+        split=split,
+        algorithm=algorithm,
+        decoder=decoder,
+        operation=operation,
+        instance_type=instance_type,
+        region=region,
+        device=device,
+        seconds=float(seconds),
+        ec2_hourly_usd=float(ec2_hourly_usd),
+        ec2_cost_per_second_usd=float(cost_per_second),
+        estimated_compute_cost_usd=float(estimated_cost),
+        seed=seed,
+        notes=notes,
+    )
+
+
+def write_cost_outputs(
+    output_dir: Path,
+    cost_records: List[CostRecord],
+    run_id: str,
+    run_wall_time_seconds: float,
+    ec2_hourly_usd: float,
+    ec2_context: dict,
+    cost_tags: dict,
+) -> None:
+    if not cost_records:
+        return
+
+    cost_df = pd.DataFrame([asdict(r) for r in cost_records])
+    cost_df.to_csv(output_dir / "operation_costs.csv", index=False)
+
+    summary = (
+        cost_df.groupby(["dataset", "algorithm", "decoder", "operation"], dropna=False)
+        .agg(
+            seconds=("seconds", "sum"),
+            estimated_compute_cost_usd=("estimated_compute_cost_usd", "sum"),
+            rows=("operation", "count"),
+        )
+        .reset_index()
+    )
+    summary.to_csv(output_dir / "operation_costs_summary.csv", index=False)
+
+    total_core_seconds = float(cost_df["seconds"].sum())
+    total_core_cost = float(cost_df["estimated_compute_cost_usd"].sum())
+    run_wall_cost = run_wall_time_seconds * (ec2_hourly_usd / 3600.0)
+
+    run_cost_summary = {
+        "run_id": run_id,
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "instance_type": ec2_context.get("instance_type", "unknown"),
+        "region": ec2_context.get("region", "unknown"),
+        "ec2_hourly_usd": ec2_hourly_usd,
+        "ec2_cost_per_second_usd": ec2_hourly_usd / 3600.0,
+        "run_wall_time_seconds": run_wall_time_seconds,
+        "estimated_run_wall_clock_ec2_cost_usd": run_wall_cost,
+        "core_operation_seconds": total_core_seconds,
+        "estimated_core_operation_ec2_cost_usd": total_core_cost,
+        "core_operation_fraction_of_run_wall_time": (
+            total_core_seconds / run_wall_time_seconds
+            if run_wall_time_seconds > 0
+            else None
+        ),
+        "core_operation_fraction_of_run_wall_clock_ec2_cost": (
+            total_core_cost / run_wall_cost
+            if run_wall_cost > 0
+            else None
+        ),
+        "aws_total_tagged_cost_usd": None,
+        "core_operation_fraction_of_aws_total_tagged_cost": None,
+        "cost_tags": cost_tags,
+        "notes": [
+            "This estimates EC2 compute cost for measured training, inference, and decoding time.",
+            "It excludes EBS storage, data transfer, idle instance time outside this Python run, snapshots, CloudWatch, and other AWS charges.",
+            "Fill aws_total_tagged_cost_usd later from AWS Cost Explorer to compute the fraction of total tagged AWS cost.",
+        ],
+    }
+
+    (output_dir / "run_cost_summary.json").write_text(
+        json.dumps(run_cost_summary, indent=2),
+        encoding="utf-8",
+    )
+
+
+# ---------------------------------------------------------------------
+# Training and evaluation
+# ---------------------------------------------------------------------
 
 
 def train_model(
@@ -519,7 +740,10 @@ def train_model(
         if mean_val < best_val_loss:
             best_val_loss = mean_val
             best_epoch = epoch
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            best_state = {
+                k: v.detach().cpu().clone()
+                for k, v in model.state_dict().items()
+            }
 
         if epoch == 1 or epoch % 10 == 0 or epoch == epochs:
             print(f"epoch={epoch:04d} train_loss={mean_train:.4f} val_loss={mean_val:.4f}")
@@ -541,7 +765,7 @@ def evaluate_graphs(
     exact_max_nodes: int,
 ) -> List[GraphResult]:
     model.eval()
-    results = []
+    results: List[GraphResult] = []
 
     with torch.no_grad():
         for G in tqdm(graphs, desc=f"evaluate {split}"):
@@ -551,8 +775,10 @@ def evaluate_graphs(
             x, adj_t, a_norm = graph_to_tensors(G, device)
             adj = adj_t.detach().cpu().numpy()
 
+            sync_if_cuda(device)
             t0 = time.time()
             probs_t = model(x, a_norm)
+            sync_if_cuda(device)
             model_time = time.time() - t0
 
             probs = probs_t.detach().cpu().numpy()
@@ -590,7 +816,12 @@ def evaluate_graphs(
     return results
 
 
-def load_dataset_by_name(name: str, data_root: Path, limit: Optional[int], seed: int) -> List[nx.Graph]:
+def load_dataset_by_name(
+    name: str,
+    data_root: Path,
+    limit: Optional[int],
+    seed: int,
+) -> List[nx.Graph]:
     if name in {"imdb_binary", "collab"}:
         return load_tu_graphs(name, data_root=data_root, limit=limit)
     if name == "twitter":
@@ -602,6 +833,17 @@ def load_dataset_by_name(name: str, data_root: Path, limit: Optional[int], seed:
     raise ValueError(f"Unknown dataset: {name}")
 
 
+def optional_float(value, default: float = 0.0) -> float:
+    if value is None:
+        return default
+    return float(value)
+
+
+# ---------------------------------------------------------------------
+# Main CLI
+# ---------------------------------------------------------------------
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
@@ -610,9 +852,22 @@ def main() -> None:
     with open(args.config, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
+    run_start_time = time.time()
+
     run_id = cfg["experiment"]["run_id"]
     seed = int(cfg["experiment"]["seed"])
     set_seed(seed)
+
+    cost_cfg = cfg.get("cost", {})
+    ec2_hourly_usd = optional_float(cost_cfg.get("ec2_hourly_usd"), default=0.0)
+    cost_tags = cost_cfg.get("cost_tags", {})
+    ec2_context = detect_ec2_context(cost_cfg)
+
+    if ec2_hourly_usd <= 0:
+        print(
+            "WARNING: cost.ec2_hourly_usd is not set or is <= 0. "
+            "Cost outputs will show $0. Set this in the YAML config."
+        )
 
     output_dir = Path(cfg["output"]["output_dir"]) / run_id
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -628,25 +883,50 @@ def main() -> None:
     layers = int(cfg["model"]["layers"])
     exact_max_nodes = int(cfg["evaluation"]["exact_max_nodes"])
 
-    device = torch.device("cuda" if torch.cuda.is_available() and cfg["compute"].get("use_cuda", True) else "cpu")
+    requested_cuda = bool(cfg.get("compute", {}).get("use_cuda", True))
+    device = torch.device("cuda" if torch.cuda.is_available() and requested_cuda else "cpu")
+
     print(f"Using device: {device}")
+    print(f"EC2 context: {ec2_context}")
+    print(f"EC2 hourly USD: {ec2_hourly_usd}")
 
     all_results: List[GraphResult] = []
+    cost_records: List[CostRecord] = []
 
     for dataset_name in dataset_names:
         print(f"\n=== Dataset: {dataset_name} ===")
-        graphs = load_dataset_by_name(dataset_name, data_root=data_root, limit=dataset_limit, seed=seed)
+        graphs = load_dataset_by_name(
+            dataset_name,
+            data_root=data_root,
+            limit=dataset_limit,
+            seed=seed,
+        )
 
-        # RB-large is treated as OOD test only in this first design.
+        # RB-large is treated as OOD test in this first design.
+        # The model is trained on RB-small and evaluated on RB-large.
         if dataset_name == "rb_large":
             splits = {"ood_test": graphs}
-            train_graphs = load_dataset_by_name("rb_small", data_root=data_root, limit=dataset_limit, seed=seed)
-            train_splits = assign_splits(train_graphs, seed=seed)
+            rb_small_graphs = load_dataset_by_name(
+                "rb_small",
+                data_root=data_root,
+                limit=dataset_limit,
+                seed=seed,
+            )
+            train_splits = assign_splits(rb_small_graphs, seed=seed)
+            training_note = "Training on RB-small, evaluating RB-large as OOD test."
         else:
             splits = assign_splits(graphs, seed=seed)
             train_splits = splits
+            training_note = "Training on this dataset's train split."
 
-        model = EGNStyleGCN(in_dim=3, hidden_dim=hidden_dim, layers=layers).to(device)
+        model = EGNStyleGCN(
+            in_dim=3,
+            hidden_dim=hidden_dim,
+            layers=layers,
+        ).to(device)
+
+        sync_if_cuda(device)
+        training_start = time.time()
 
         model, best_epoch, best_val_loss = train_model(
             model=model,
@@ -656,6 +936,27 @@ def main() -> None:
             epochs=epochs,
             lr=lr,
             beta=beta,
+        )
+
+        sync_if_cuda(device)
+        training_seconds = time.time() - training_start
+
+        cost_records.append(
+            make_cost_record(
+                run_id=run_id,
+                dataset=dataset_name,
+                split="train",
+                algorithm="egn_style",
+                decoder="not_applicable_training",
+                operation="training",
+                instance_type=ec2_context["instance_type"],
+                region=ec2_context["region"],
+                device=str(device),
+                seconds=training_seconds,
+                ec2_hourly_usd=ec2_hourly_usd,
+                seed=seed,
+                notes=training_note,
+            )
         )
 
         model_path = output_dir / f"egn_style_{dataset_name}_best.pt"
@@ -671,18 +972,60 @@ def main() -> None:
         )
 
         for split_name, split_graphs in splits.items():
-            all_results.extend(
-                evaluate_graphs(
-                    model=model,
-                    graphs=split_graphs,
+            split_results = evaluate_graphs(
+                model=model,
+                graphs=split_graphs,
+                split=split_name,
+                device=device,
+                beta=beta,
+                seed=seed,
+                epoch_selected=best_epoch,
+                exact_max_nodes=exact_max_nodes,
+            )
+
+            all_results.extend(split_results)
+
+            inference_seconds = sum(r.model_time_seconds for r in split_results)
+            decoding_seconds = sum(r.decode_time_seconds for r in split_results)
+
+            cost_records.append(
+                make_cost_record(
+                    run_id=run_id,
+                    dataset=dataset_name,
                     split=split_name,
-                    device=device,
-                    beta=beta,
+                    algorithm="egn_style",
+                    decoder="egn_author_conditional_expectation_repaired",
+                    operation="inference_forward_pass",
+                    instance_type=ec2_context["instance_type"],
+                    region=ec2_context["region"],
+                    device=str(device),
+                    seconds=inference_seconds,
+                    ec2_hourly_usd=ec2_hourly_usd,
                     seed=seed,
-                    epoch_selected=best_epoch,
-                    exact_max_nodes=exact_max_nodes,
+                    notes="Sum of GNN forward-pass time over graphs in this split.",
                 )
             )
+
+            cost_records.append(
+                make_cost_record(
+                    run_id=run_id,
+                    dataset=dataset_name,
+                    split=split_name,
+                    algorithm="egn_style",
+                    decoder="egn_author_conditional_expectation_repaired",
+                    operation="decoding",
+                    instance_type=ec2_context["instance_type"],
+                    region=ec2_context["region"],
+                    device=str(device),
+                    seconds=decoding_seconds,
+                    ec2_hourly_usd=ec2_hourly_usd,
+                    seed=seed,
+                    notes="Sum of decoder-only time over graphs in this split.",
+                )
+            )
+
+    if not all_results:
+        raise RuntimeError("No graph results were generated. Check dataset config.")
 
     results_csv = output_dir / "egn_author_decoder_results.csv"
     with results_csv.open("w", newline="", encoding="utf-8") as f:
@@ -700,25 +1043,54 @@ def main() -> None:
             median_clique_size=("clique_size", "median"),
             valid_rate=("is_valid_clique", "mean"),
             mean_approx_ratio=("approx_ratio", "mean"),
+            mean_model_time_seconds=("model_time_seconds", "mean"),
+            mean_decode_time_seconds=("decode_time_seconds", "mean"),
             mean_total_time_seconds=("total_time_seconds", "mean"),
         )
         .reset_index()
     )
     summary.to_csv(output_dir / "egn_author_decoder_summary.csv", index=False)
 
+    run_wall_time_seconds = time.time() - run_start_time
+
+    write_cost_outputs(
+        output_dir=output_dir,
+        cost_records=cost_records,
+        run_id=run_id,
+        run_wall_time_seconds=run_wall_time_seconds,
+        ec2_hourly_usd=ec2_hourly_usd,
+        ec2_context=ec2_context,
+        cost_tags=cost_tags,
+    )
+
     metadata = {
         "run_id": run_id,
         "seed": seed,
         "device": str(device),
+        "ec2_context": ec2_context,
+        "ec2_hourly_usd": ec2_hourly_usd,
+        "ec2_cost_per_second_usd": ec2_hourly_usd / 3600.0,
+        "run_wall_time_seconds": run_wall_time_seconds,
+        "cost_tags": cost_tags,
         "config": cfg,
         "outputs": {
             "results_csv": str(results_csv),
             "summary_csv": str(output_dir / "egn_author_decoder_summary.csv"),
+            "operation_costs_csv": str(output_dir / "operation_costs.csv"),
+            "operation_costs_summary_csv": str(output_dir / "operation_costs_summary.csv"),
+            "run_cost_summary_json": str(output_dir / "run_cost_summary.json"),
         },
     }
-    (output_dir / "run_metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    (output_dir / "run_metadata.json").write_text(
+        json.dumps(metadata, indent=2),
+        encoding="utf-8",
+    )
 
     print(f"\nDone. Results written to: {output_dir}")
+    print(f"Results CSV: {results_csv}")
+    print(f"Summary CSV: {output_dir / 'egn_author_decoder_summary.csv'}")
+    print(f"Cost records: {output_dir / 'operation_costs.csv'}")
+    print(f"Cost summary: {output_dir / 'run_cost_summary.json'}")
 
 
 if __name__ == "__main__":

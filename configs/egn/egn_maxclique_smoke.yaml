@@ -30,3 +30,24 @@ compute:
 
 output:
   output_dir: results/egn_maxclique
+
+cost:
+  currency: USD
+
+  # Replace this with the actual EC2 hourly price for your instance type and region.
+  # Example: g5.xlarge in us-east-1 has often been around 1.006 USD/hour,
+  # but you should verify the current price in your AWS account/region.
+  ec2_hourly_usd: 1.006
+
+  # Optional manual labels. If null, the script will try EC2 metadata.
+  instance_type: null
+  region: null
+
+  # Tags used for AWS-side cost tracking.
+  cost_tags:
+    Project: CO_Decoder_Experiments
+    Owner: Bharat
+    CostScope: Bharat_PhD
+    Experiment: MaxClique_EGN_AuthorDecoder
+    Algorithm: EGN
+    RunID: egn_smoke_seed42
