@@ -1,0 +1,30 @@
+experiment:
+  name: egn_maxclique_author_decoder_full_initial
+  run_id: egn_full_initial_seed42
+  seed: 42
+
+data:
+  data_root: data
+  datasets:
+    - rb_small
+    - rb_large
+    - imdb_binary
+    - collab
+    - twitter
+  limit_per_dataset: null
+
+model:
+  hidden_dim: 128
+  layers: 3
+  beta: 5.0
+  epochs: 100
+  learning_rate: 0.001
+
+evaluation:
+  exact_max_nodes: 120
+
+compute:
+  use_cuda: true
+
+output:
+  output_dir: results/egn_maxclique

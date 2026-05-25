@@ -1,0 +1,32 @@
+experiment:
+  name: egn_maxclique_author_decoder_smoke
+  run_id: egn_smoke_seed42
+  seed: 42
+
+data:
+  data_root: data
+  datasets:
+    - rb_small
+    - imdb_binary
+    - collab
+    # Add twitter after the smaller smoke test works.
+    # - twitter
+    # Add rb_large for OOD smoke after rb_small works.
+    # - rb_large
+  limit_per_dataset: 6
+
+model:
+  hidden_dim: 64
+  layers: 3
+  beta: 5.0
+  epochs: 20
+  learning_rate: 0.001
+
+evaluation:
+  exact_max_nodes: 120
+
+compute:
+  use_cuda: true
+
+output:
+  output_dir: results/egn_maxclique
